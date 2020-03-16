@@ -173,6 +173,7 @@ class MemoryMoCo(nn.Module):
         # pos logit
         l_pos = torch.bmm(q.view(batchSize, 1, -1), k.view(batchSize, -1, 1))
         l_pos = l_pos.view(batchSize, 1)
+
         # neg logit
         queue = self.memory.clone()
         l_neg = torch.mm(queue.detach(), q.transpose(1, 0))

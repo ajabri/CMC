@@ -14,11 +14,15 @@ import torch
 import torch.backends.cudnn as cudnn
 import argparse
 import socket
+import numpy as np
 
 import tensorboard_logger as tb_logger
 
 from torchvision import transforms, datasets
-from util import adjust_learning_rate, AverageMeter
+from util import adjust_learning_rate, AverageMeter, pca_viz
+
+import torchvision
+import visdom
 
 from models.resnet import InsResNet50
 from NCE.NCEAverage import MemoryInsDis
@@ -26,6 +30,8 @@ from NCE.NCEAverage import MemoryMoCo
 from NCE.NCECriterion import NCECriterion
 from NCE.NCECriterion import NCESoftmaxLoss
 
+# import maskoff
+from models.maskoff import Masker
 from dataset import ImageFolderInstance
 
 try:
@@ -79,6 +85,7 @@ def parse_option():
 
     # model definition
     parser.add_argument('--model', type=str, default='resnet50', choices=['resnet50', 'resnet50x2', 'resnet50x4'])
+    parser.add_argument('--exp_name', type=str, default='')
 
     # loss function
     parser.add_argument('--softmax', action='store_true', help='using softmax contrastive loss rather than NCE')
@@ -93,13 +100,24 @@ def parse_option():
     # GPU setting
     parser.add_argument('--gpu', default=None, type=int, help='GPU id to use.')
 
+    # Mask options
+    parser.add_argument('--mloss_coef', type=float, default=0.0)
+    parser.add_argument('--maloss_coef', type=float, default=0.0)
+    parser.add_argument('--maloss_mode', type=str, default='l1')
+    parser.add_argument('--mask_mode', type=str, default='bilinear')
+    parser.add_argument('--visualize', action='store_true', default=False)
+
     opt = parser.parse_args()
 
     # set the path according to the environment
-    if hostname.startswith('visiongpu'):
-        opt.data_folder = '/dev/shm/yonglong/{}'.format(opt.dataset)
-        opt.model_path = '/data/vision/phillipi/rep-learn/Pedesis/CMC/{}_models'.format(opt.dataset)
-        opt.tb_path = '/data/vision/phillipi/rep-learn/Pedesis/CMC/{}_tensorboard'.format(opt.dataset)
+    if hostname.startswith('em4'):
+        opt.data_folder = '/scratch/ajabri/data/{}'.format(opt.dataset)
+        opt.model_path = '/scratch/ajabri/data/CMC/{}_models'.format(opt.dataset)
+        opt.tb_path = '/scratch/ajabri/data/CMC/{}_tensorboard'.format(opt.dataset)
+    elif hostname.startswith('kiwi'):
+        opt.data_folder = '/data/ajabri/imagenet/{}'.format(opt.dataset)
+        opt.model_path = '/data/ajabri/CMC/{}_models'.format(opt.dataset)
+        opt.tb_path = '/data/ajabri/CMC/{}_tensorboard'.format(opt.dataset) 
     else:
         raise NotImplementedError('server invalid: {}'.format(hostname))
 
@@ -115,9 +133,11 @@ def parse_option():
     opt.method = 'softmax' if opt.softmax else 'nce'
     prefix = 'MoCo{}'.format(opt.alpha) if opt.moco else 'InsDis'
 
-    opt.model_name = '{}_{}_{}_{}_lr_{}_decay_{}_bsz_{}_crop_{}'.format(prefix, opt.method, opt.nce_k, opt.model,
+    opt.model_name = '{}_{}_{}_{}_{}_lr_{}_decay_{}_bsz_{}_crop_{}_m{}_ma{}_mm{}_mam{}'.format(opt.exp_name, prefix, opt.method, opt.nce_k, opt.model,
                                                                         opt.learning_rate, opt.weight_decay,
-                                                                        opt.batch_size, opt.crop)
+                                                                        opt.batch_size, opt.crop,
+                                                                        opt.mloss_coef, opt.maloss_coef,
+                                                                        opt.mask_mode, opt.maloss_mode)
 
     if opt.warm:
         opt.model_name = '{}_warm'.format(opt.model_name)
@@ -150,6 +170,18 @@ def get_shuffle_ids(bsz):
     value = torch.arange(bsz).long().cuda()
     backward_inds.index_copy_(0, forward_inds, value)
     return forward_inds, backward_inds
+
+
+def partial_load(pretrained_dict, model):
+    model_dict = model.state_dict()
+
+    # 1. filter out unnecessary keys
+    pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
+    print('Loading keys: ',  pretrained_dict.keys())
+    # 2. overwrite entries in the existing state dict
+    model_dict.update(pretrained_dict)
+    # 3. load the new state dict
+    model.load_state_dict(model_dict)
 
 
 def main():
@@ -224,15 +256,32 @@ def main():
     criterion = NCESoftmaxLoss() if args.softmax else NCECriterion(n_data)
     criterion = criterion.cuda(args.gpu)
 
+    model.masker = Masker(128, 20, mode=args.mask_mode, nonlin='softmax', prior=args.maloss_mode)
+
     model = model.cuda()
     if args.moco:
         model_ema = model_ema.cuda()
+
+    if args.visualize:
+        vis = visdom.Visdom(port=8095, env='moco')
+        vis.close()
+
+
+        checkpoint = torch.load(args.resume, map_location='cpu')
+        args.start_epoch = checkpoint['epoch'] + 1
+
+        if not any(['masker' in name for name in checkpoint['model'].keys()]):
+            (checkpoint['model'], model)
+        else:
+            model.load_state_dict(checkpoint['model'])
+
+        return visualize(train_loader, model, vis, args)
 
     optimizer = torch.optim.SGD(model.parameters(),
                                 lr=args.learning_rate,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
-
+    
     cudnn.benchmark = True
 
     if args.amp:
@@ -252,7 +301,12 @@ def main():
             checkpoint = torch.load(args.resume, map_location='cpu')
             # checkpoint = torch.load(args.resume)
             args.start_epoch = checkpoint['epoch'] + 1
-            model.load_state_dict(checkpoint['model'])
+    
+            if not any(['masker' in name for name in checkpoint['model'].keys()]):
+                partial_load(checkpoint['model'], model)
+            else:
+                model.load_state_dict(checkpoint['model'])
+            
             optimizer.load_state_dict(checkpoint['optimizer'])
             contrast.load_state_dict(checkpoint['contrast'])
             if args.moco:
@@ -280,14 +334,19 @@ def main():
 
         time1 = time.time()
         if args.moco:
-            loss, prob = train_moco(epoch, train_loader, model, model_ema, contrast, criterion, optimizer, args)
+            loss, prob = train_moco(epoch, train_loader, model, model_ema, contrast, criterion, optimizer, args, logger)
         else:
             loss, prob = train_ins(epoch, train_loader, model, contrast, criterion, optimizer, args)
         time2 = time.time()
         print('epoch {}, total time {:.2f}'.format(epoch, time2 - time1))
 
         # tensorboard logger
-        logger.log_value('ins_loss', loss, epoch)
+        if isinstance(loss, dict):
+            for k in loss:
+                logger.log_value('ins_loss_%s' % k, loss[k], epoch)
+        else:
+            logger.log_value('ins_loss', loss, epoch)
+
         logger.log_value('ins_prob', prob, epoch)
         logger.log_value('learning_rate', optimizer.param_groups[0]['lr'], epoch)
 
@@ -397,7 +456,7 @@ def train_ins(epoch, train_loader, model, contrast, criterion, optimizer, opt):
     return loss_meter.avg, prob_meter.avg
 
 
-def train_moco(epoch, train_loader, model, model_ema, contrast, criterion, optimizer, opt):
+def train_moco(epoch, train_loader, model, model_ema, contrast, criterion, optimizer, opt, logger):
     """
     one epoch training for instance discrimination
     """
@@ -414,6 +473,8 @@ def train_moco(epoch, train_loader, model, model_ema, contrast, criterion, optim
     batch_time = AverageMeter()
     data_time = AverageMeter()
     loss_meter = AverageMeter()
+    mloss_meter = AverageMeter()
+    maloss_meter = AverageMeter()
     prob_meter = AverageMeter()
 
     end = time.time()
@@ -446,7 +507,28 @@ def train_moco(epoch, train_loader, model, model_ema, contrast, criterion, optim
         loss = criterion(out)
         prob = out[:, 0].mean()
 
+        # ===================meters=====================
+        loss_meter.update(loss.item(), bsz)
+        prob_meter.update(prob.item(), bsz)
+
+        # ===== maskoff ======
+        if opt.mloss_coef > 0:
+            masks, m_out, m_aux_loss = model.masker(feat_q, feat_k)
+            m_loss = criterion(torch.cat([m_out[:, None], out[:, 0:1]], dim=-1))
+
+            loss = loss + opt.mloss_coef * m_loss + opt.maloss_coef * m_aux_loss
+
+            if np.random.random() < 0.01:
+                mmm = masks.mean(0).cpu().detach().numpy().tolist()
+                logger.log_histogram('mask_hist', mmm)
+        else:
+            m_loss = m_aux_loss = torch.Tensor([0])
+
+        mloss_meter.update(m_loss.item(), bsz)
+        maloss_meter.update(m_aux_loss.item(), bsz)
+
         # ===================backward=====================
+
         optimizer.zero_grad()
         if opt.amp:
             with amp.scale_loss(loss, optimizer) as scaled_loss:
@@ -455,9 +537,7 @@ def train_moco(epoch, train_loader, model, model_ema, contrast, criterion, optim
             loss.backward()
         optimizer.step()
 
-        # ===================meters=====================
-        loss_meter.update(loss.item(), bsz)
-        prob_meter.update(prob.item(), bsz)
+        # ===================momentum_update=====================
 
         moment_update(model, model_ema, opt.alpha)
 
@@ -471,13 +551,114 @@ def train_moco(epoch, train_loader, model, model_ema, contrast, criterion, optim
                   'BT {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
                   'DT {data_time.val:.3f} ({data_time.avg:.3f})\t'
                   'loss {loss.val:.3f} ({loss.avg:.3f})\t'
+                  'mloss {mloss.val:.3f} ({mloss.avg:.3f})\t'
+                  'maloss {maloss.val:.3f} ({maloss.avg:.3f})\t'
                   'prob {prob.val:.3f} ({prob.avg:.3f})'.format(
                    epoch, idx + 1, len(train_loader), batch_time=batch_time,
-                   data_time=data_time, loss=loss_meter, prob=prob_meter))
-            print(out.shape)
+                   data_time=data_time, loss=loss_meter, mloss=mloss_meter, maloss=maloss_meter,
+                   prob=prob_meter))
+            # print(out.shape)
             sys.stdout.flush()
 
-    return loss_meter.avg, prob_meter.avg
+    return dict(
+        loss=loss_meter.avg, 
+        mloss=mloss_meter.avg,
+        maloss=maloss_meter.avg,
+    ), prob_meter.avg
+
+
+
+def visualize(train_loader, model, vis, opt):
+    """
+    one epoch training for instance discrimination
+    """
+
+    model.eval()
+
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+
+    end = time.time()
+
+    f1 = []
+    f2 = []
+    idxs = []
+
+    X1 = []
+    X2 = []
+
+    n = 0
+    for idx, (inputs, _, index) in enumerate(train_loader):
+        data_time.update(time.time() - end)
+        n+=1 
+        if n == 100:
+            break
+
+        bsz = inputs.size(0)
+
+        inputs = inputs.float()
+
+        # ===================forward=====================
+        x1, x2 = torch.split(inputs, [3, 3], dim=1)
+
+        with torch.no_grad():
+            feat_q = model(x1)
+            feat_k = model(x2)
+
+        f1.append(feat_q.cpu())
+        f2.append(feat_k.cpu())
+        idxs.append(index.cpu())
+        X1 += [x1.cpu()]
+        X2 += [x2.cpu()]
+
+        torch.cuda.synchronize()
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+        # print info
+        if (idx + 1) % opt.print_freq == 0:
+            print('Train: [{0}][{1}/{2}]\t'
+                  'BT {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                  'DT {data_time.val:.3f} ({data_time.avg:.3f})\t'.format(
+                   str(0), idx + 1, len(train_loader), batch_time=batch_time,
+                   data_time=data_time,))
+            # print(out.shape)
+            sys.stdout.flush()
+
+    from sklearn.decomposition import PCA
+
+    idxs = torch.cat(idxs+idxs, dim=0)
+    f = torch.cat(f1+f2, dim=0)
+    X = torch.cat(X1+X2, dim=0)
+
+    D = torch.matmul(f,  f.t())
+
+    X -= X.min(); X /= X.max()
+
+    f1 = torch.cat(f1, dim=0)
+    f2 = torch.cat(f2, dim=0)
+
+    ########################### PCA ###########################
+    K = 10
+    pca = PCA(n_components=K, svd_solver='auto', whiten=False)
+    p_f = pca.fit_transform(f.numpy())
+
+    l = []
+    step = p_f.shape[0]//100
+    i_f = np.argsort(p_f, axis=0)[::step]
+
+    for k in range(K):
+        vis.image(torchvision.utils.make_grid(X[i_f[:, k]], nrow=10, padding=2, pad_value=0).cpu().numpy())
+
+    vis.text('NN', opts=dict(width=1000, h=10))
+    ########################### NN  ###########################
+    V, I = torch.topk(D, 50, dim=-1)
+    import pdb; pdb.set_trace()
+
+    for _k in range(K):
+        k = np.random.randint(X.shape[0])
+        vis.image(torchvision.utils.make_grid(X[I[k]], nrow=10, padding=2, pad_value=0).cpu().numpy())
+
 
 
 if __name__ == '__main__':
